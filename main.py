@@ -6,11 +6,15 @@ For every past big launch shipped inside the case file ("comparables"), we take
 its release-day hourly curve and express it as log-ratios to its own hour-1
 print, ln(v_h / v_1) for h = 2..24.  The forecast for the target launch is
 
-    q_tau(h) = p1 * exp(m_h + z_tau * s_h)
+    q_tau(h) = p1 * exp(x_tau(h))
 
-where p1 is the target's hour-1 print, m_h is a *weighted median* of the
-comparables' log-ratios at hour h, s_h is a *weighted spread* of those same
-log-ratios, and z_tau is the standard normal quantile at the scored level.
+where p1 is the target's hour-1 print and x_tau(h) is the tau-quantile of a
+two-component normal mixture over the comparables' log-ratios at hour h:
+one component for early-peak / flat launches, one for late-surge launches
+(peak hour 17 or later), each fitted by its weighted median and robust
+spread, mixed by the surge group's share of the kernel weight. A single
+normal cannot express the two shapes past launches actually take; the
+mixture can (see "Two shapes, not one" below).
 
 Why this shape, and why these weights
 --------------------------------------
@@ -43,11 +47,25 @@ launch whose hour 1 is under 3% of its release-day peak (its real unlock
 came hours later, so hour 1 is pre-launch noise), and any launch with fewer
 than 18 usable release-day hours.
 
+Two shapes, not one: past launches split into early-peak / flat ones (their
+release-day peak lands before the evening, or hour 1 already is the peak)
+and late-surge ones (peak in the US-afternoon/evening window, hour 17 or
+later). A single normal pooled over both puts its median between the two
+groups and its symmetric spread cannot express that the mass below the
+median is tight while the mass above it is spread out. So each group is
+fitted separately -- weighted median and the robust spread below -- and
+the scored quantiles are the inverses of the two-normal mixture's CDF,
+with the surge weight at each hour equal to the surge group's share of the
+kernel weight. When a group is empty at an hour, that hour uses the pooled
+single normal instead.
+
 Spread: s_h is the mean of two robust spread estimators of the same
 weighted log-ratio distribution -- the 90% range / (2 x 1.645) and the
-interquartile range / 1.349 -- clipped to [0.25, 0.90]. Both the median curve
-and the spread are smoothed across neighbouring hours with a [0.25, 0.5,
-0.25] kernel, because a launch curve is smooth and hourly medians are noisy.
+interquartile range / 1.349 -- clipped to [0.25, 0.90]. Every quantile
+curve is smoothed across neighbouring hours with a [0.25, 0.5, 0.25]
+kernel, because a launch curve is smooth and hourly quantiles are noisy;
+smoothing with non-negative weights preserves the ordering of the five
+quantiles at each hour.
 
 If the case carries too few usable comparables (< 5 with a usable hour),
 the program falls back to FALLBACK_MED / FALLBACK_SIG, the same quantities
@@ -55,9 +73,20 @@ computed over the full comparable set in the kit (a typical mid-size
 rolling-midnight launch), so the entry still forecasts instead of crashing.
 
 Backtest (leave-one-out over the 29 usable comparables in the kit, scored
-with the contest's own log-scale pinball loss): this model scores 0.270
-against the house baseline's 0.360 on the same launches, typical miss
-57.9% against 83.5%, 90% coverage 0.868 against 0.757.
+with the contest's own log-scale pinball loss): this model scores 0.265
+against the house baseline's 0.359 on the same launches, typical miss
+56.9% against 83.5%, 90% coverage 0.900 against 0.757 (the single-normal
+version scored 0.270, miss 57.9%, coverage 0.868). The gain is broad -- 18 of 29 launches improve,
+including the big early-peak launches most like GTA VI (ELDEN RING 0.125
+to 0.089, Cyberpunk 2077 0.155 to 0.126, Starfield 0.498 to 0.400,
+Assassin's Creed Shadows 0.428 to 0.349) -- and the biggest-15 launches
+improve from 0.242 to 0.230. Honest weak spot, unchanged: the extreme
+delayed-surge launches (Resident Evil Requiem 0.996 to 1.056, its hour-19
+count sits 2.45 log units above its hour 1, beyond even the surge group's
+own 95th percentile) -- no hour-1-observable signal separates them, and
+every fatter-tailed variant tested bought that coverage back at a worse
+overall loss, so the mixture keeps the honest spread rather than chasing
+one outlier.
 
 Deterministic: no randomness, no wall-clock, no dict-order dependence --
 every collection is sorted before use, so two runs write byte-identical
@@ -87,6 +116,8 @@ SIGMA_CAP = 0.90
 MIN_USABLE_HOURS = 18
 MIN_H1_PEAK_FRACTION = 0.03
 MIN_COMPARABLES = 5
+SURGE_PEAK_HOUR = 17   # a launch peaks "late" when its release-day peak
+                        # hour is 17 or later (the US-afternoon/evening window)
 
 # --- fallback prior: pooled median log-ratio curve and spread for a typical
 # rolling-midnight launch, computed over the kit's full comparable set. Used
@@ -209,11 +240,73 @@ def smooth_curve(curve):
     return out
 
 
-def fit_shape(p1, target_buzz, comparables):
-    """Fit (median log-ratio, spread) per hour from the case's comparables.
+def norm_cdf(x):
+    """Standard normal CDF, via the error function (stdlib only)."""
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
 
-    Returns ({hour: median}, {hour: sigma}); falls back to the embedded prior
-    when too few comparables survive the filters.
+
+def group_log_ratio_stats(pairs):
+    """(Weighted median, robust spread) of (log-ratio, weight) pairs.
+
+    The spread is the mean of two robust estimators of the same weighted
+    distribution -- the 90% range / (2 x 1.645) and the interquartile range
+    / 1.349 -- clipped to [SIGMA_FLOOR, SIGMA_CAP]. Returns None for an
+    empty group.
+    """
+    if not pairs:
+        return None
+    median = weighted_percentile(pairs, 0.5)
+    spread_90 = (weighted_percentile(pairs, 0.95)
+                 - weighted_percentile(pairs, 0.05)) / (2.0 * 1.645)
+    spread_iqr = (weighted_percentile(pairs, 0.75)
+                  - weighted_percentile(pairs, 0.25)) / 1.349
+    sigma = min(SIGMA_CAP, max(SIGMA_FLOOR, 0.5 * (spread_90 + spread_iqr)))
+    return median, sigma
+
+
+def mixture_quantile(m_flat, s_flat, m_surge, s_surge, w_surge, tau):
+    """One quantile of a two-normal mixture, by bisection on its CDF.
+
+    Component "flat" (weight 1 - w_surge) is the early-peak / flat launches,
+    component "surge" (weight w_surge) the late-peak ones. The bisection
+    brackets the quantile between the components' +/-4-sigma points, far
+    outside any scored level, and runs a fixed 60 iterations, so the result
+    is deterministic.
+    """
+    lo = min(m_flat - 4.0 * s_flat, m_surge - 4.0 * s_surge)
+    hi = max(m_flat + 4.0 * s_flat, m_surge + 4.0 * s_surge)
+    for _ in range(60):
+        mid = 0.5 * (lo + hi)
+        cdf = (w_surge * norm_cdf((mid - m_surge) / s_surge)
+               + (1.0 - w_surge) * norm_cdf((mid - m_flat) / s_flat))
+        if cdf < tau:
+            lo = mid
+        else:
+            hi = mid
+    return 0.5 * (lo + hi)
+
+
+def fit_shape(p1, target_buzz, comparables):
+    """Fit per-hour log-ratio quantile curves from the case's comparables.
+
+    Returns {level: {hour: log-quantile}} for the five scored levels; falls
+    back to the embedded prior (median curve +/- z * spread) when too few
+    comparables survive the filters.
+
+    The quantiles come from a two-component mixture, not a single normal.
+    Past launches genuinely split into two shapes: early-peak / flat ones
+    (their release-day peak lands before the evening, or hour 1 already is
+    the peak) and late-surge ones (peak in the US-afternoon/evening window,
+    hour 17 or later). A single normal pooled over both puts its median
+    between the two groups -- too high for the flat launches (Starfield,
+    Assassin's Creed Shadows: the old model's median at hour 19 sat 0.7-1.1
+    log units above their counts) and its symmetric spread cannot express
+    that the mass below the median is tight while the mass above it is
+    spread out. Each component is fitted separately (weighted median and
+    robust spread, same size/buzz kernels as before), the surge weight at
+    each hour is the surge group's share of the kernel weight, and the
+    scored quantiles are the mixture CDF's inverses. When a group is empty
+    at an hour, that hour falls back to the pooled single normal.
     """
     usable = []
     for comp in comparables:
@@ -233,18 +326,22 @@ def fit_shape(p1, target_buzz, comparables):
         except (KeyError, TypeError, ValueError):
             continue
         buzz = prebuzz_ratio(hours, day_start, comp.get("hourly") or [])
-        usable.append((base, hours, buzz))
+        peak_hour = max(hours, key=lambda h: hours[h])
+        usable.append((base, hours, buzz, peak_hour >= SURGE_PEAK_HOUR))
 
     if len(usable) < MIN_COMPARABLES:
-        return dict(FALLBACK_MED), dict(FALLBACK_SIG)
+        curves = {}
+        for tau, z in zip(LEVELS, Z):
+            curves[tau] = {h: FALLBACK_MED[h] + z * FALLBACK_SIG[h]
+                           for h in range(2, 25)}
+        return curves
 
     log_p1 = math.log(p1)
     log_buzz = math.log(max(target_buzz, 1e-4)) if target_buzz is not None else None
-    medians = {}
-    sigmas = {}
+    curves = {tau: {} for tau in LEVELS}
     for hour in range(2, 25):
-        pairs = []
-        for base, hours, buzz in usable:
+        groups = {True: [], False: []}
+        for base, hours, buzz, is_surge in usable:
             if hour not in hours:
                 continue
             weight = base * math.exp(
@@ -254,24 +351,43 @@ def fit_shape(p1, target_buzz, comparables):
                 weight *= math.exp(
                     -0.5 * ((math.log(max(buzz, 1e-4)) - log_buzz) / BUZZ_BANDWIDTH) ** 2
                 )
-            pairs.append((math.log(hours[hour] / hours[1]), weight))
-        if not pairs:
-            medians[hour] = FALLBACK_MED[hour]
-            sigmas[hour] = FALLBACK_SIG[hour]
+            groups[is_surge].append((math.log(hours[hour] / hours[1]), weight))
+        flat = group_log_ratio_stats(groups[False])
+        surge = group_log_ratio_stats(groups[True])
+        if flat is None or surge is None:
+            pooled = group_log_ratio_stats(groups[False] + groups[True])
+            if pooled is None:
+                for tau, z in zip(LEVELS, Z):
+                    curves[tau][hour] = FALLBACK_MED[hour] + z * FALLBACK_SIG[hour]
+                continue
+            median, sigma = pooled
+            for tau, z in zip(LEVELS, Z):
+                curves[tau][hour] = median + z * sigma
             continue
-        medians[hour] = weighted_percentile(pairs, 0.5)
-        spread_90 = (weighted_percentile(pairs, 0.95) - weighted_percentile(pairs, 0.05)) / (2.0 * 1.645)
-        spread_iqr = (weighted_percentile(pairs, 0.75) - weighted_percentile(pairs, 0.25)) / 1.349
-        sigmas[hour] = min(SIGMA_CAP, max(SIGMA_FLOOR, 0.5 * (spread_90 + spread_iqr)))
-    return smooth_curve(medians), smooth_curve(sigmas)
+        (m_flat, s_flat), (m_surge, s_surge) = flat, surge
+        total_weight = sum(w for _, w in groups[True]) + sum(w for _, w in groups[False])
+        w_surge = (sum(w for _, w in groups[True]) / total_weight
+                   if total_weight > 0 else 0.5)
+        for tau in LEVELS:
+            curves[tau][hour] = mixture_quantile(
+                m_flat, s_flat, m_surge, s_surge, w_surge, tau)
+    for tau in LEVELS:
+        curves[tau] = smooth_curve(curves[tau])
+    return curves
 
 
-def hour_quantiles(p1, median_log_ratio, sigma):
-    """The five quantiles for one hour, rounded and kept ordered and valid."""
+def hour_quantiles(p1, log_quantiles):
+    """The five quantiles for one hour, rounded and kept ordered and valid.
+
+    log_quantiles are the five log-ratio quantiles for the hour, in level
+    order; the caller guarantees they are non-decreasing (smoothing a set
+    of ordered curves with non-negative weights preserves the order), and
+    the clamp here is only a safety net.
+    """
     quantiles = []
     previous = 0.0
-    for z in Z:
-        value = p1 * math.exp(median_log_ratio + z * sigma)
+    for log_q in log_quantiles:
+        value = p1 * math.exp(log_q)
         value = round2(value)
         value = min(max(value, 1.0), 1e9)
         if value < previous:
@@ -299,13 +415,13 @@ def forecast_case(case, name):
             {1: p1}, day_start, case.get("history_hourly") or []
         )
 
-    medians, sigmas = fit_shape(p1, target_buzz, case.get("comparables") or [])
+    curves = fit_shape(p1, target_buzz, case.get("comparables") or [])
     rows = []
     for row in case["forecast"]:
         hour = row["hour"]
         rows.append({
             "hour": hour,
-            "q": hour_quantiles(p1, medians[hour], sigmas[hour]),
+            "q": hour_quantiles(p1, [curves[tau][hour] for tau in LEVELS]),
         })
     rows.sort(key=lambda row: row["hour"])
     return {"hours": rows}
